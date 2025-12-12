@@ -1,170 +1,166 @@
-from typing import List, Optional, Set
-from motor.motor_asyncio import (
-    AsyncIOMotorClient,
-    AsyncIOMotorDatabase,
-    AsyncIOMotorCollection
-)
+from typing import List, Optional
 
-from pymongo.errors import CollectionInvalid
 from source.Logging import Logger
-
-from source.Database.Models import UserModel, ChannelModel
+from source.Database.database import DatabaseManager, User, Channel
+from source.Database.crud import CRUD
 from source.TelegramMessageScrapper.PyroClient import PyroClient
-# from source.ChromaАndRAG.ChromaClient import RagClient
 
 
 class DataBaseHelper:
+    """
+    Обёртка над PostgreSQL для работы с БД.
+    Интерфейс остаётся тот же, что и с MongoDB.
+    Меняется только внутренняя реализация на SQLAlchemy + PostgreSQL.
+    """
+
     def __init__(
         self,
-        db: AsyncIOMotorDatabase,
+        db_manager: DatabaseManager,
         scrapper: Optional[PyroClient]
     ):
-        self.mongo_db_logger = Logger("MongoDB", "network.log")
-        self.db = db
-        self.users: AsyncIOMotorCollection = db["users"]
-        self.channels: AsyncIOMotorCollection = db["channels"]
+        self.logger = Logger("PostgreSQL", "network.log")
+        self.db_manager = db_manager
         self.scrapper = scrapper
+        self.crud = None
 
     @classmethod
     async def create(
         cls,
-        uri: str = "",
-        db_name: str = "",
-        scrapper: PyroClient = None  # Add scrapper argument
+        db_url: str = "",
+        scrapper: PyroClient = None
     ) -> "DataBaseHelper":
-
-        client = AsyncIOMotorClient(uri)
-        db = client[db_name]
-        self = cls(db, scrapper)  # Pass scrapper to the constructor
+        """
+        Фабричный метод для создания DataBaseHelper.
+        
+        Args:
+            db_url: PostgreSQL connection string (postgresql+asyncpg://user:password@host/db)
+            scrapper: PyroClient для скрейпинга сообщений
+        
+        Returns:
+            Инициализированный DataBaseHelper
+        """
+        db_manager = DatabaseManager(db_url)
+        await db_manager.init()
+        self = cls(db_manager, scrapper)
         await self._setup()
-        await self.mongo_db_logger.info("MongoDB connected")
+        await self.logger.info("PostgreSQL connected")
         return self
 
-    async def _setup(self) -> None:
-        collections = await self.db.list_collection_names()
-        if "users" not in collections:
-            try:
-                await self.db.create_collection("users")
-            except CollectionInvalid:
-                await self.mongo_db_logger.warning(
-                    "Collection 'users' already exists"
-                )
-        if "channels" not in collections:
-            try:
-                await self.db.create_collection("channels")
-            except CollectionInvalid:
-                await self.mongo_db_logger.warning(
-                    "Collection 'channels' already exists"
-                )
+    async def _setup(self):
+        """Инициализация базы данных"""
+        # Для проверки подключения просто пытаемся получить сессию
+        async with self.db_manager.get_session() as session:
+            # Просто проверка что подключение работает
+            pass
+        await self.logger.info("PostgreSQL connection established successfully")
+
+    # ============= USER METHODS =============
 
     async def create_user(self, user_id: int, name: str) -> None:
-        if await self.users.find_one({"_id": user_id}):
-            await self.mongo_db_logger.warning(
-                f"User '{user_id}' already exists"
-            )
-            raise ValueError("User already exists")
-        user = UserModel(
-            id=user_id,
-            name=name
-        )
-        await self.users.insert_one(user.dict(by_alias=True))
+        """
+        Создать пользователя.
+        Интерфейс совпадает с MongoDB версией.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            await crud.create_user(user_id, name)
 
-    async def delete_user(self, user_id: int) -> list:
-        channels_to_unsubscribe = []
-        user_doc = await self.users.find_one({"_id": user_id})
-        if not user_doc:
-            await self.mongo_db_logger.warning(f"User '{user_id}' not found")
-            raise ValueError("User not found")
-        user = UserModel(**user_doc)
-        for channel_id in user.channels:
-            res = await self._decrement_channel(channel_id)
-            if res:
-                channels_to_unsubscribe.append(channel_id)
+    async def get_user(self, user_id: int):
+        """Получить пользователя"""
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            user = await crud.get_user(user_id)
+            
+            if not user:
+                raise ValueError(f"User with id {user_id} not found")
+            
+            # crud.get_user() уже возвращает dict, просто возвращаем его
+            return user
 
-        await self.users.delete_one({"_id": user_id})
-        return channels_to_unsubscribe
+    async def delete_user(self, user_id: int) -> List[int]:
+        """
+        Удалить пользователя.
+        Возвращает список ID каналов без подписчиков.
+        Интерфейс совпадает с MongoDB версией.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            return await crud.delete_user(user_id)
 
     async def update_user_channels(
         self,
         user_id: int,
         add: Optional[List[int]] = None,
         remove: Optional[List[int]] = None
-    ) -> list:
-        channels_to_unsubscribe = []
-        doc = await self.users.find_one({"_id": user_id})
-        if not doc:
-            raise ValueError("User not found")
-        user = UserModel(**doc)
-        current: Set[int] = set(user.channels)
-        to_add = set(add or [])
-        to_remove = set(remove or [])
-        for ch in to_add:
-            if not await self.channels.find_one({"_id": ch}):
-                raise ValueError(f"Channel {ch} does not exist")
-        for ch in to_add - current:
-            await self._increment_channel(ch)
-        for ch in to_remove & current:
-            res = await self._decrement_channel(ch)
-            if res:
-                channels_to_unsubscribe.append(ch)
-        updated = (current | to_add) - to_remove
-        user.channels = list(updated)
-        await self.users.replace_one(
-            {"_id": user_id},
-            user.dict(by_alias=True)
-        )
-        return channels_to_unsubscribe
+    ) -> List[int]:
+        """
+        Обновить каналы пользователя.
+        Интерфейс совпадает с MongoDB версией.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            return await crud.update_user_channels(user_id, add, remove)
 
-    async def get_user(self, user_id: int) -> UserModel:
-        doc = await self.users.find_one({"_id": user_id})
-        if not doc:
-            raise ValueError("User not found")
-        return UserModel(**doc)
+    # ============= CHANNEL METHODS =============
 
     async def create_channel(self, channel_id: int, name: str) -> None:
-        if await self.channels.find_one({"_id": channel_id}):
-            await self.mongo_db_logger.warning(
-                f"Channel '{channel_id}' already exists. Will not create one."
-            )
-            raise ValueError("Channel already exists")
-        channel = ChannelModel(id=channel_id, name=name)
-        await self.channels.insert_one(channel.dict(by_alias=True))
+        """
+        Создать канал.
+        Интерфейс совпадает с MongoDB версией.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            await crud.create_channel(channel_id, name)
+
+    async def get_channel(self, channel_id: int) -> dict:
+        """
+        Получить канал.
+        Возвращаем в формате совместимом с Pydantic моделью.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            channel = await crud.get_channel(channel_id)
+            return {
+                "id": channel.id,
+                "name": channel.name,
+                "subscribers": channel.subscribers
+            }
 
     async def delete_channel(self, channel_id: int) -> None:
-        doc = await self.channels.find_one({"_id": channel_id})
-        if not doc:
-            raise ValueError("Channel not found")
+        """
+        Удалить канал.
+        Интерфейс совпадает с MongoDB версией.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            await crud.delete_channel(channel_id)
 
-        if doc["subscribers"] > 0:
-            raise ValueError("Channel has subscribers")
+    # ============= SUBSCRIPTION METHODS =============
 
-        await self.channels.delete_one({"_id": channel_id})
+    async def subscribe(self, user_id: int, channel_id: int) -> None:
+        """Подписать пользователя на канал"""
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            await crud.subscribe(user_id, channel_id)
 
-    async def get_channel(self, channel_id: int) -> ChannelModel:
-        doc = await self.channels.find_one({"_id": channel_id})
-        if not doc:
-            raise ValueError("Channel not found")
-        return ChannelModel(**doc)
+    async def unsubscribe(self, user_id: int, channel_id: int) -> bool:
+        """
+        Отписать пользователя от канала.
+        Возвращает True если канал остался без подписчиков.
+        """
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            return await crud.unsubscribe(user_id, channel_id)
 
-    async def _increment_channel(self, channel_id: int) -> None:
-        await self.channels.update_one(
-            {"_id": channel_id},
-            {"$inc": {"subscribers": 1}}
-        )
+    # ============= UTILITY METHODS =============
 
-    async def _decrement_channel(self, channel_id: int) -> bool:
-        to_remove = False
-        doc = await self.channels.find_one({"_id": channel_id})
-        if not doc:
-            return to_remove
+    async def get_all_users_for_channel(self, channel_id: int) -> List[int]:
+        """Получить все ID пользователей подписанных на канал"""
+        async with self.db_manager.get_session() as session:
+            crud = CRUD(session, self.logger)
+            users = await crud.get_all_users_for_channel(channel_id)
+            return [u.id for u in users]
 
-        if doc["subscribers"] <= 1:
-            await self.channels.delete_one({"_id": channel_id})
-            to_remove = True
-            return to_remove
-        else:
-            await self.channels.update_one(
-                {"_id": channel_id},
-                {"$inc": {"subscribers": -1}}
-            )
-            return to_remove
+    async def close(self):
+        """Закрыть подключение к БД"""
+        await self.db_manager.close()

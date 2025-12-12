@@ -208,7 +208,7 @@ class BotApp:
             )
             return None
 
-        user_channels = user.channels
+        user_channels = user['channels'] if user else []
         channel_names = []
         for channel in user_channels:
             chat = await self.bot.get_chat(channel)
@@ -227,18 +227,18 @@ class BotApp:
             user = await self.DataBaseHelper.get_user(user_id)
         except ValueError:
             return None
-
-        user_channels = user.channels
+        
+        user_channels = user['channels']
         channel_names = []
         for channel in user_channels:
             info = await self.DataBaseHelper.get_channel(channel)
             if info:
-                channel_names.append({"id": info.id, "name": info.name})
+                channel_names.append({"id": info['id'], "name": info['name']})  # ← Используй dict
             else:
-                channel_names.append(
-                    {"id": info.id, "name": "Неизвестный канал"})
-
+                channel_names.append({"id": channel, "name": "Неизвестный канал"})  # ← И здесь тоже
+        
         return channel_names
+
 
     async def __remove_command_handler(self, message: Message):
         channels = await self.__get_channels_internal(message.from_user.id)
@@ -366,7 +366,7 @@ class BotApp:
             )
             return
 
-        user_channels: list[int] = user.channels
+        user_channels: list[int] = user['channels'] if user else []
         if not user_channels:
             await self.telegram_ui_logger.error(
                 "User has no channels. Or there is something wrong with DB."
@@ -383,12 +383,12 @@ class BotApp:
 
         texts = []
         for channel in user_channels:
-            channel_name = await self.DataBaseHelper.get_channel(channel)
+            channel_info = await self.DataBaseHelper.get_channel(channel)
             posts = await self.Scrapper.fetch(channel)
             texts.append(
                 {
                     "channel_id": channel,
-                    "channel_name": channel_name.name,
+                    "channel_name": channel_info['name'],
                     "posts": posts
                 }
             )
